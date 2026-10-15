@@ -66,6 +66,16 @@ from openai import OpenAI
 #                                               hardcodes 10, the proxy rewrites
 #                                               the first element of every
 #                                               (connect, read) timeout tuple
+#   OAI_COMPAT_READ_TIMEOUT      (default 60.0) seconds waiting for the response
+#                                               (first byte, and max gap between
+#                                               SSE chunks); the SDK feeds this
+#                                               from MAX_REQUEST_TIMEOUT (default
+#                                               300) or hardcodes 300 — the proxy
+#                                               rewrites the second tuple element
+#                                               so the SDK-wide env var (which
+#                                               also governs the plugin↔daemon
+#                                               connection lifetime in plugin.py)
+#                                               stays untouched
 # ---------------------------------------------------------------------------
 import dify_plugin.interfaces.model.openai_compatible.llm as _sdk_compat_llm
 from requests.adapters import HTTPAdapter as _HTTPAdapter
@@ -76,6 +86,7 @@ _POOL_MAXSIZE = int(os.environ.get("OAI_COMPAT_POOL_MAXSIZE", "128"))
 _RETRY_TOTAL = int(os.environ.get("OAI_COMPAT_RETRY_TOTAL", "2"))
 _RETRY_BACKOFF = float(os.environ.get("OAI_COMPAT_RETRY_BACKOFF", "1"))
 _CONNECT_TIMEOUT = float(os.environ.get("OAI_COMPAT_CONNECT_TIMEOUT", "5"))
+_READ_TIMEOUT = float(os.environ.get("OAI_COMPAT_READ_TIMEOUT", "60"))
 
 _pooled_session = requests.Session()
 _pooled_retry = _Retry(
@@ -97,17 +108,19 @@ for _scheme in ("https://", "http://"):
     )
 
 
-def _override_connect_timeout(kwargs: dict) -> dict:
-    """Replace the connect timeout the SDK hardcoded to 10s.
+def _override_timeouts(kwargs: dict) -> dict:
+    """Replace the SDK's hardcoded (connect, read) timeout tuple.
 
-    urllib3 applies the first tuple element to the TCP+TLS connect phase and
-    (until the response wait begins) also to the request-body send phase, so
-    this value bounds both. The read timeout (second element) is passed
-    through untouched. Non-tuple timeouts are left as-is.
+    - first element (connect): bounds TCP+TLS handshake AND request-body send
+      (urllib3 applies it to both); SDK hardcodes 10
+    - second element (read): bounds waiting for the first response byte and
+      the max gap between chunks once streaming; SDK feeds it from
+      MAX_REQUEST_TIMEOUT (default 300) or hardcodes 300
+    Non-tuple timeouts are left as-is.
     """
     timeout = kwargs.get("timeout")
     if isinstance(timeout, tuple) and len(timeout) == 2:
-        kwargs["timeout"] = (_CONNECT_TIMEOUT, timeout[1])
+        kwargs["timeout"] = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
     return kwargs
 
 
@@ -115,10 +128,10 @@ class _PooledRequestsProxy:
     """Delegate post/get to the pooled session, everything else to requests."""
 
     def post(self, url, **kwargs):
-        return _pooled_session.post(url, **_override_connect_timeout(kwargs))
+        return _pooled_session.post(url, **_override_timeouts(kwargs))
 
     def get(self, url, **kwargs):
-        return _pooled_session.get(url, **_override_connect_timeout(kwargs))
+        return _pooled_session.get(url, **_override_timeouts(kwargs))
 
     def __getattr__(self, name):
         return getattr(requests, name)
