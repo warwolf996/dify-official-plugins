@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from contextlib import suppress
 from typing import Any, Mapping, Optional, Union, Generator, List
@@ -37,6 +38,73 @@ from dify_plugin.errors.model import CredentialsValidateFailedError, InvokeError
 from dify_plugin.interfaces.model.openai_compatible.llm import OAICompatLargeLanguageModel
 
 from openai import OpenAI
+
+# ---------------------------------------------------------------------------
+# Pooled HTTP session patch for the SDK's per-call `requests.post(...)`.
+#
+# dify_plugin.interfaces.model.openai_compatible.llm calls module-level
+# `requests.post()` for every LLM invocation, which internally builds a
+# throw-away Session: a brand-new TCP + TLS handshake per request, zero
+# keep-alive reuse and zero retries. Under concurrency spikes this inflates
+# the new-connection rate towards the provider and makes requests vulnerable
+# to middle-box rate limiting (observed as send-phase connection timeouts).
+#
+# The shim below replaces the SDK module's `requests` attribute with a proxy
+# that routes post/get through one shared, process-lifetime Session with a
+# keep-alive connection pool and safe retries (retries only fire before any
+# response byte is received, so streamed POSTs are never replayed mid-stream).
+# Everything else (requests.exceptions.*, requests.Response, ...) is delegated
+# to the original module so the SDK's error mapping keeps working unchanged.
+#
+# Tunables (environment variables of the plugin_daemon container):
+#   OAI_COMPAT_POOL_CONNECTIONS  (default 32)   cached host pools
+#   OAI_COMPAT_POOL_MAXSIZE      (default 128)  connections kept per host
+#   OAI_COMPAT_RETRY_TOTAL       (default 2)    connect/total retry budget
+#   OAI_COMPAT_RETRY_BACKOFF     (default 1.0)  urllib3 backoff factor (seconds)
+# ---------------------------------------------------------------------------
+import dify_plugin.interfaces.model.openai_compatible.llm as _sdk_compat_llm
+from requests.adapters import HTTPAdapter as _HTTPAdapter
+from urllib3.util.retry import Retry as _Retry
+
+_POOL_CONNECTIONS = int(os.environ.get("OAI_COMPAT_POOL_CONNECTIONS", "32"))
+_POOL_MAXSIZE = int(os.environ.get("OAI_COMPAT_POOL_MAXSIZE", "128"))
+_RETRY_TOTAL = int(os.environ.get("OAI_COMPAT_RETRY_TOTAL", "2"))
+_RETRY_BACKOFF = float(os.environ.get("OAI_COMPAT_RETRY_BACKOFF", "1"))
+
+_pooled_session = requests.Session()
+_pooled_retry = _Retry(
+    total=_RETRY_TOTAL,
+    connect=_RETRY_TOTAL,
+    read=1,  # only when no response byte was received yet (stale keep-alive conn, aborted send)
+    backoff_factor=_RETRY_BACKOFF,
+    status_forcelist=(502, 503, 504),
+    allowed_methods=None,  # retry POST as well: requests are replayed only pre-response
+)
+for _scheme in ("https://", "http://"):
+    _pooled_session.mount(
+        _scheme,
+        _HTTPAdapter(
+            pool_connections=_POOL_CONNECTIONS,
+            pool_maxsize=_POOL_MAXSIZE,
+            max_retries=_pooled_retry,
+        ),
+    )
+
+
+class _PooledRequestsProxy:
+    """Delegate post/get to the pooled session, everything else to requests."""
+
+    def post(self, url, **kwargs):
+        return _pooled_session.post(url, **kwargs)
+
+    def get(self, url, **kwargs):
+        return _pooled_session.get(url, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(requests, name)
+
+
+_sdk_compat_llm.requests = _PooledRequestsProxy()
 
 
 class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
