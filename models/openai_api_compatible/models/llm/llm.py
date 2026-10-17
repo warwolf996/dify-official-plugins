@@ -545,6 +545,18 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             ):
                 entity.features.append(feature)
 
+        # Advertise streamable tool calls so agent strategies (e.g. FunctionCalling)
+        # stream model invocations instead of blocking on the full response.
+        # In streaming mode the read timeout only bounds the gap between SSE
+        # chunks, which keeps long generations from tripping the HTTP read
+        # timeout. Opt out with OAI_COMPAT_STREAM_TOOL_CALL=0 if a gateway has
+        # broken streamed tool-call deltas.
+        if (
+            os.environ.get("OAI_COMPAT_STREAM_TOOL_CALL", "1").lower() not in ("0", "false", "no")
+            and ModelFeature.STREAM_TOOL_CALL not in entity.features
+        ):
+            entity.features.append(ModelFeature.STREAM_TOOL_CALL)
+
         return entity
 
     @classmethod
@@ -945,6 +957,47 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             model=response_json.get("model", model),
             message=assistant_message,
             usage=usage,
+        )
+
+    def _create_final_llm_result_chunk(
+        self,
+        index: int,
+        message: AssistantPromptMessage,
+        finish_reason: str,
+        usage: Optional[dict],
+        model: str,
+        prompt_messages: list[PromptMessage],
+        credentials: dict,
+        full_content: str,
+    ) -> LLMResultChunk:
+        """Stream-path companion of the [prompt-cache] log.
+
+        The SDK base keeps the raw vendor usage dict until the final stream
+        chunk, which is the last place ``prompt_tokens_details.cached_tokens``
+        / ``prompt_cache_hit_tokens`` are still available in streaming mode.
+        The non-streaming path logs the same line from
+        ``_handle_generate_response``.
+        """
+        try:
+            if usage and usage.get("prompt_tokens") is not None:
+                self._log_prompt_cache_stats(
+                    model,
+                    prompt_messages,
+                    usage.get("prompt_tokens") or 0,
+                    usage.get("completion_tokens") or 0,
+                    usage,
+                )
+        except Exception:
+            pass
+        return super()._create_final_llm_result_chunk(
+            index=index,
+            message=message,
+            finish_reason=finish_reason,
+            usage=usage,
+            model=model,
+            prompt_messages=prompt_messages,
+            credentials=credentials,
+            full_content=full_content,
         )
 
     @staticmethod
