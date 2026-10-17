@@ -594,14 +594,13 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             ):
                 entity.features.append(feature)
 
-        # Advertise streamable tool calls so agent strategies (e.g. FunctionCalling)
-        # stream model invocations instead of blocking on the full response.
-        # In streaming mode the read timeout only bounds the gap between SSE
-        # chunks, which keeps long generations from tripping the HTTP read
-        # timeout. Opt out with OAI_COMPAT_STREAM_TOOL_CALL=0 if a gateway has
-        # broken streamed tool-call deltas.
+        # Advertise streamable tool calls so agent strategies (e.g. Function
+        # Calling) stream model invocations instead of blocking on the full
+        # response. In streaming mode the HTTP read timeout only bounds the
+        # gap between SSE chunks, which keeps long generations from tripping
+        # it. Opt-out for gateways with broken streamed tool-call deltas.
         if (
-            os.environ.get("OAI_COMPAT_STREAM_TOOL_CALL", "1").lower() not in ("0", "false", "no")
+            credentials.get("stream_tool_call_support", "support") == "support"
             and ModelFeature.STREAM_TOOL_CALL not in entity.features
         ):
             entity.features.append(ModelFeature.STREAM_TOOL_CALL)
