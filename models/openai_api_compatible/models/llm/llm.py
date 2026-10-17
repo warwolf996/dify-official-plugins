@@ -141,43 +141,33 @@ _sdk_compat_llm.requests = _PooledRequestsProxy()
 
 
 # ---------------------------------------------------------------------------
-# Dedicated logger for prompt-cache observability.
+# Prompt-cache observability.
 #
 # The plugin daemon swallows plugin stdout into its own storage and Dify
-# exposes no UI channel for plugin runtime logs, so cache stats are written
-# to a size-rotated file inside the daemon container:
-#   docker exec <plugin_daemon> tail -f /tmp/prompt-cache.log
+# exposes no UI channel for plugin runtime logs, so every LLM call is dumped
+# as one JSON line (messages + raw response + usage) to a size-rotated file
+# inside the daemon container:
+#   docker exec <plugin_daemon> tail -f /tmp/prompt-cache-requests.jsonl
+# Stats are derivable from that dump via jq; a one-line summary is still
+# printed to stdout for local/remote-debugging runs.
+# All timestamps use Beijing time (UTC+8) because containers run UTC.
 # Tunables:
-#   OAI_COMPAT_CACHE_LOG_PATH      (default /tmp/prompt-cache.log)
-#   OAI_COMPAT_CACHE_LOG_MAXBYTES  (default 10 MiB per file)
-#   OAI_COMPAT_CACHE_LOG_BACKUPS   (default 5 rotated files kept)
-# stdout printing is kept for local/remote-debugging runs where the plugin
-# process owns its terminal.
+#   OAI_COMPAT_DUMP_LOG_PATH      (default /tmp/prompt-cache-requests.jsonl)
+#   OAI_COMPAT_DUMP_LOG_MAXBYTES  (default 50 MiB per file)
+#   OAI_COMPAT_DUMP_LOG_BACKUPS   (default 3 rotated files kept)
+#   OAI_COMPAT_DUMP_REQUESTS      (default on; 0 disables the dump)
 # ---------------------------------------------------------------------------
 import logging
+from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
 
-_prompt_cache_logger = logging.getLogger("openai_api_compatible.prompt_cache")
-if not _prompt_cache_logger.handlers:
-    _prompt_cache_logger.setLevel(logging.INFO)
-    _prompt_cache_logger.propagate = False
-    try:
-        _cache_log_handler = RotatingFileHandler(
-            os.environ.get("OAI_COMPAT_CACHE_LOG_PATH", "/tmp/prompt-cache.log"),
-            maxBytes=int(os.environ.get("OAI_COMPAT_CACHE_LOG_MAXBYTES", str(10 * 1024 * 1024))),
-            backupCount=int(os.environ.get("OAI_COMPAT_CACHE_LOG_BACKUPS", "5")),
-            encoding="utf-8",
-        )
-        _cache_log_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        _prompt_cache_logger.addHandler(_cache_log_handler)
-    except Exception:
-        pass  # fall back to stdout-only logging
+_BEIJING_TZ = timezone(timedelta(hours=8))
 
-# Full request/response dump for cache-hit forensics, one JSON object per
-# line. Tools schemas are intentionally excluded (verified stable across
-# requests); messages and the raw response are kept verbatim.
-#   docker exec <plugin_daemon> tail -f /tmp/prompt-cache-requests.jsonl
-# Turn off with OAI_COMPAT_DUMP_REQUESTS=0.
+
+def _now_beijing() -> str:
+    return datetime.now(_BEIJING_TZ).isoformat(timespec="seconds")
+
+
 _dump_requests_enabled = os.environ.get("OAI_COMPAT_DUMP_REQUESTS", "1").lower() not in ("0", "false", "no")
 _prompt_cache_dump_logger = logging.getLogger("openai_api_compatible.prompt_cache_dump")
 if not _prompt_cache_dump_logger.handlers:
@@ -1121,10 +1111,9 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
                 f"prompt={prompt_tokens} completion={completion_tokens} cached={cached} "
                 f"rate={rate:.1%} time_line={last_system_line!r} q={query_head[:30]!r}"
             )
-            # Rotating file (see _prompt_cache_logger setup); stdout copy kept
-            # for local/remote-debugging runs.
-            _prompt_cache_logger.info(line)
-            print(line, flush=True)
+            # Stats are derivable from the jsonl dump; this one-liner is only
+            # printed to stdout for local/remote-debugging runs.
+            print(f"{_now_beijing()} {line}", flush=True)
         except Exception as e:
             print(f"[prompt-cache] failed to log stats: {e}", flush=True)
 
@@ -1172,7 +1161,7 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             return
         try:
             record = {
-                "ts": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+                "ts": _now_beijing(),
                 "mode": mode,
                 "model": model,
                 "request": {"messages": OpenAILargeLanguageModel._serialize_prompt_messages(prompt_messages)},
