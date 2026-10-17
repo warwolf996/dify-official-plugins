@@ -146,11 +146,12 @@ _sdk_compat_llm.requests = _PooledRequestsProxy()
 # The plugin daemon swallows plugin stdout into its own storage and Dify
 # exposes no UI channel for plugin runtime logs, so every LLM call is dumped
 # as one JSON line (messages + raw response + usage) to a size-rotated file
-# inside the daemon container:
-#   docker exec <plugin_daemon> tail -f /tmp/prompt-cache-requests.jsonl
+# under the daemon's mounted volume (survives container restarts, readable
+# from the host at ./volumes/plugin_daemon/request-log/):
+#   tail -f ./volumes/plugin_daemon/request-log/prompt-cache-requests.jsonl
 # All timestamps use Beijing time (UTC+8) because containers run UTC.
 # Tunables:
-#   OAI_COMPAT_DUMP_LOG_PATH      (default /tmp/prompt-cache-requests.jsonl)
+#   OAI_COMPAT_DUMP_LOG_PATH      (default /app/storage/request-log/prompt-cache-requests.jsonl)
 #   OAI_COMPAT_DUMP_LOG_MAXBYTES  (default 50 MiB per file)
 #   OAI_COMPAT_DUMP_LOG_BACKUPS   (default 3 rotated files kept)
 #   OAI_COMPAT_DUMP_REQUESTS      (default on; 0 disables the dump)
@@ -172,8 +173,12 @@ if not _prompt_cache_dump_logger.handlers:
     _prompt_cache_dump_logger.setLevel(logging.INFO)
     _prompt_cache_dump_logger.propagate = False
     try:
+        _dump_log_path = os.environ.get(
+            "OAI_COMPAT_DUMP_LOG_PATH", "/app/storage/request-log/prompt-cache-requests.jsonl"
+        )
+        os.makedirs(os.path.dirname(_dump_log_path) or ".", exist_ok=True)
         _dump_handler = RotatingFileHandler(
-            os.environ.get("OAI_COMPAT_DUMP_LOG_PATH", "/tmp/prompt-cache-requests.jsonl"),
+            _dump_log_path,
             maxBytes=int(os.environ.get("OAI_COMPAT_DUMP_LOG_MAXBYTES", str(50 * 1024 * 1024))),
             backupCount=int(os.environ.get("OAI_COMPAT_DUMP_LOG_BACKUPS", "3")),
             encoding="utf-8",
