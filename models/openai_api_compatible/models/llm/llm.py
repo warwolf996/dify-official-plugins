@@ -1037,12 +1037,23 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             last_system_line = system_content.strip().splitlines()[-1] if system_content.strip() else ""
 
             rate = (cached / prompt_tokens) if prompt_tokens else 0.0
-            print(
+            line = (
                 f"[prompt-cache] model={model} msgs={len(prompt_messages)} "
                 f"prompt={prompt_tokens} completion={completion_tokens} cached={cached} "
-                f"rate={rate:.1%} time_line={last_system_line!r} q={query_head[:30]!r}",
-                flush=True,
+                f"rate={rate:.1%} time_line={last_system_line!r} q={query_head[:30]!r}"
             )
+            print(line, flush=True)
+            # The plugin daemon does not mirror plugin stdout into its own
+            # container log stream (it stores logs for the web UI instead), so
+            # also append to a file inside the plugin container:
+            #   docker exec <plugin_daemon> tail -f /tmp/prompt-cache.log
+            # Override the location with OAI_COMPAT_CACHE_LOG_PATH.
+            try:
+                log_path = os.environ.get("OAI_COMPAT_CACHE_LOG_PATH", "/tmp/prompt-cache.log")
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
         except Exception as e:
             print(f"[prompt-cache] failed to log stats: {e}", flush=True)
 
