@@ -140,6 +140,40 @@ class _PooledRequestsProxy:
 _sdk_compat_llm.requests = _PooledRequestsProxy()
 
 
+# ---------------------------------------------------------------------------
+# Dedicated logger for prompt-cache observability.
+#
+# The plugin daemon swallows plugin stdout into its own storage and Dify
+# exposes no UI channel for plugin runtime logs, so cache stats are written
+# to a size-rotated file inside the daemon container:
+#   docker exec <plugin_daemon> tail -f /tmp/prompt-cache.log
+# Tunables:
+#   OAI_COMPAT_CACHE_LOG_PATH      (default /tmp/prompt-cache.log)
+#   OAI_COMPAT_CACHE_LOG_MAXBYTES  (default 10 MiB per file)
+#   OAI_COMPAT_CACHE_LOG_BACKUPS   (default 5 rotated files kept)
+# stdout printing is kept for local/remote-debugging runs where the plugin
+# process owns its terminal.
+# ---------------------------------------------------------------------------
+import logging
+from logging.handlers import RotatingFileHandler
+
+_prompt_cache_logger = logging.getLogger("openai_api_compatible.prompt_cache")
+if not _prompt_cache_logger.handlers:
+    _prompt_cache_logger.setLevel(logging.INFO)
+    _prompt_cache_logger.propagate = False
+    try:
+        _cache_log_handler = RotatingFileHandler(
+            os.environ.get("OAI_COMPAT_CACHE_LOG_PATH", "/tmp/prompt-cache.log"),
+            maxBytes=int(os.environ.get("OAI_COMPAT_CACHE_LOG_MAXBYTES", str(10 * 1024 * 1024))),
+            backupCount=int(os.environ.get("OAI_COMPAT_CACHE_LOG_BACKUPS", "5")),
+            encoding="utf-8",
+        )
+        _cache_log_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _prompt_cache_logger.addHandler(_cache_log_handler)
+    except Exception:
+        pass  # fall back to stdout-only logging
+
+
 class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
     # Pre-compiled regex for better performance
     _THINK_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
@@ -1042,18 +1076,10 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
                 f"prompt={prompt_tokens} completion={completion_tokens} cached={cached} "
                 f"rate={rate:.1%} time_line={last_system_line!r} q={query_head[:30]!r}"
             )
+            # Rotating file (see _prompt_cache_logger setup); stdout copy kept
+            # for local/remote-debugging runs.
+            _prompt_cache_logger.info(line)
             print(line, flush=True)
-            # The plugin daemon does not mirror plugin stdout into its own
-            # container log stream (it stores logs for the web UI instead), so
-            # also append to a file inside the plugin container:
-            #   docker exec <plugin_daemon> tail -f /tmp/prompt-cache.log
-            # Override the location with OAI_COMPAT_CACHE_LOG_PATH.
-            try:
-                log_path = os.environ.get("OAI_COMPAT_CACHE_LOG_PATH", "/tmp/prompt-cache.log")
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            except Exception:
-                pass
         except Exception as e:
             print(f"[prompt-cache] failed to log stats: {e}", flush=True)
 
