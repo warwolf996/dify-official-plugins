@@ -148,8 +148,6 @@ _sdk_compat_llm.requests = _PooledRequestsProxy()
 # as one JSON line (messages + raw response + usage) to a size-rotated file
 # inside the daemon container:
 #   docker exec <plugin_daemon> tail -f /tmp/prompt-cache-requests.jsonl
-# Stats are derivable from that dump via jq; a one-line summary is still
-# printed to stdout for local/remote-debugging runs.
 # All timestamps use Beijing time (UTC+8) because containers run UTC.
 # Tunables:
 #   OAI_COMPAT_DUMP_LOG_PATH      (default /tmp/prompt-cache-requests.jsonl)
@@ -991,7 +989,6 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
         if usage:
             prompt_tokens = usage["prompt_tokens"]
             completion_tokens = usage["completion_tokens"]
-            self._log_prompt_cache_stats(model, prompt_messages, prompt_tokens, completion_tokens, usage)
             self._dump_prompt_cache_record("non-stream", model, prompt_messages, response_json, usage)
         else:
             prompt_tokens = self._num_tokens_from_messages(prompt_messages, credentials=credentials)
@@ -1017,23 +1014,14 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
         credentials: dict,
         full_content: str,
     ) -> LLMResultChunk:
-        """Stream-path companion of the [prompt-cache] log.
+        """Stream-path dump hook.
 
         The SDK base keeps the raw vendor usage dict until the final stream
         chunk, which is the last place ``prompt_tokens_details.cached_tokens``
         / ``prompt_cache_hit_tokens`` are still available in streaming mode.
-        The non-streaming path logs the same line from
-        ``_handle_generate_response``.
+        The non-streaming path dumps from ``_handle_generate_response``.
         """
         try:
-            if usage and usage.get("prompt_tokens") is not None:
-                self._log_prompt_cache_stats(
-                    model,
-                    prompt_messages,
-                    usage.get("prompt_tokens") or 0,
-                    usage.get("completion_tokens") or 0,
-                    usage,
-                )
             response_view = {
                 "model": model,
                 "choices": [
@@ -1070,53 +1058,6 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
         )
 
     @staticmethod
-    def _log_prompt_cache_stats(
-        model: str,
-        prompt_messages: list[PromptMessage],
-        prompt_tokens: int,
-        completion_tokens: int,
-        raw_usage: dict,
-    ) -> None:
-        """
-        Log vendor-reported prompt cache hit tokens for cache-hit-rate analysis.
-
-        Supports both the OpenAI-style ``usage.prompt_tokens_details.cached_tokens``
-        and the DeepSeek-style ``usage.prompt_cache_hit_tokens`` fields. Prints to
-        stdout with flush because the plugin process runs without a configured
-        logging handler and its stdio is captured by the plugin daemon. The last
-        line of the system message and the head of the last user message act as
-        correlation keys for joining against workflow_node_executions.inputs.
-        """
-        try:
-            details = raw_usage.get("prompt_tokens_details") or {}
-            cached = details.get("cached_tokens") if isinstance(details, dict) else None
-            if cached is None:
-                cached = raw_usage.get("prompt_cache_hit_tokens")
-            cached = int(cached or 0)
-
-            system_content = ""
-            query_head = ""
-            for message in prompt_messages:
-                if isinstance(message, SystemPromptMessage) and isinstance(message.content, str):
-                    system_content = message.content
-                elif isinstance(message, UserPromptMessage):
-                    content = message.content
-                    query_head = content if isinstance(content, str) else str(content)
-
-            last_system_line = system_content.strip().splitlines()[-1] if system_content.strip() else ""
-
-            rate = (cached / prompt_tokens) if prompt_tokens else 0.0
-            line = (
-                f"[prompt-cache] model={model} msgs={len(prompt_messages)} "
-                f"prompt={prompt_tokens} completion={completion_tokens} cached={cached} "
-                f"rate={rate:.1%} time_line={last_system_line!r} q={query_head[:30]!r}"
-            )
-            # Stats are derivable from the jsonl dump; this one-liner is only
-            # printed to stdout for local/remote-debugging runs.
-            print(f"{_now_beijing()} {line}", flush=True)
-        except Exception as e:
-            print(f"[prompt-cache] failed to log stats: {e}", flush=True)
-
     @staticmethod
     def _serialize_prompt_messages(prompt_messages: list[PromptMessage]) -> list[dict]:
         """Render PromptMessage list into an OpenAI-style plain structure."""
@@ -1170,8 +1111,8 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             if raw_usage:
                 record["usage"] = raw_usage
             _prompt_cache_dump_logger.info(json.dumps(record, ensure_ascii=False, default=str))
-        except Exception as e:
-            print(f"[prompt-cache] failed to dump record: {e}", flush=True)
+        except Exception:
+            pass
 
     @staticmethod
     def _adapt_schema_for_structured_outputs(schema: dict) -> dict:
