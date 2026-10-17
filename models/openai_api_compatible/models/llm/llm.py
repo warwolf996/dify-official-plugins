@@ -1063,7 +1063,6 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
         )
 
     @staticmethod
-    @staticmethod
     def _serialize_prompt_messages(prompt_messages: list[PromptMessage]) -> list[dict]:
         """Render PromptMessage list into an OpenAI-style plain structure."""
         items = []
