@@ -173,6 +173,28 @@ if not _prompt_cache_logger.handlers:
     except Exception:
         pass  # fall back to stdout-only logging
 
+# Full request/response dump for cache-hit forensics, one JSON object per
+# line. Tools schemas are intentionally excluded (verified stable across
+# requests); messages and the raw response are kept verbatim.
+#   docker exec <plugin_daemon> tail -f /tmp/prompt-cache-requests.jsonl
+# Turn off with OAI_COMPAT_DUMP_REQUESTS=0.
+_dump_requests_enabled = os.environ.get("OAI_COMPAT_DUMP_REQUESTS", "1").lower() not in ("0", "false", "no")
+_prompt_cache_dump_logger = logging.getLogger("openai_api_compatible.prompt_cache_dump")
+if not _prompt_cache_dump_logger.handlers:
+    _prompt_cache_dump_logger.setLevel(logging.INFO)
+    _prompt_cache_dump_logger.propagate = False
+    try:
+        _dump_handler = RotatingFileHandler(
+            os.environ.get("OAI_COMPAT_DUMP_LOG_PATH", "/tmp/prompt-cache-requests.jsonl"),
+            maxBytes=int(os.environ.get("OAI_COMPAT_DUMP_LOG_MAXBYTES", str(50 * 1024 * 1024))),
+            backupCount=int(os.environ.get("OAI_COMPAT_DUMP_LOG_BACKUPS", "3")),
+            encoding="utf-8",
+        )
+        _dump_handler.setFormatter(logging.Formatter("%(message)s"))
+        _prompt_cache_dump_logger.addHandler(_dump_handler)
+    except Exception:
+        pass
+
 
 class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
     # Pre-compiled regex for better performance
@@ -980,6 +1002,7 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             prompt_tokens = usage["prompt_tokens"]
             completion_tokens = usage["completion_tokens"]
             self._log_prompt_cache_stats(model, prompt_messages, prompt_tokens, completion_tokens, usage)
+            self._dump_prompt_cache_record("non-stream", model, prompt_messages, response_json, usage)
         else:
             prompt_tokens = self._num_tokens_from_messages(prompt_messages, credentials=credentials)
             completion_tokens = self._num_tokens_from_string(assistant_message.content or "")
@@ -1021,6 +1044,28 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
                     usage.get("completion_tokens") or 0,
                     usage,
                 )
+            response_view = {
+                "model": model,
+                "choices": [
+                    {
+                        "message": {
+                            "content": full_content,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": tc.type,
+                                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                                }
+                                for tc in (message.tool_calls or [])
+                            ]
+                            or None,
+                        },
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": usage,
+            }
+            self._dump_prompt_cache_record("stream", model, prompt_messages, response_view, usage)
         except Exception:
             pass
         return super()._create_final_llm_result_chunk(
@@ -1082,6 +1127,62 @@ class OpenAILargeLanguageModel(OAICompatLargeLanguageModel):
             print(line, flush=True)
         except Exception as e:
             print(f"[prompt-cache] failed to log stats: {e}", flush=True)
+
+    @staticmethod
+    def _serialize_prompt_messages(prompt_messages: list[PromptMessage]) -> list[dict]:
+        """Render PromptMessage list into an OpenAI-style plain structure."""
+        items = []
+        for m in prompt_messages:
+            content = m.content
+            if isinstance(content, list):
+                parts = []
+                for c in content:
+                    if getattr(c, "type", None) == PromptMessageContentType.TEXT:
+                        parts.append(c.data)
+                    else:
+                        parts.append(f"[{getattr(c, 'type', 'media')}]")
+                content = "".join(parts)
+            elif not isinstance(content, str):
+                content = str(content)
+            item = {"role": m.role, "content": content}
+            if isinstance(m, ToolPromptMessage):
+                item["tool_call_id"] = m.tool_call_id
+            if isinstance(m, AssistantPromptMessage) and m.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in m.tool_calls
+                ]
+            items.append(item)
+        return items
+
+    @staticmethod
+    def _dump_prompt_cache_record(
+        mode: str,
+        model: str,
+        prompt_messages: list[PromptMessage],
+        response: dict,
+        raw_usage: Optional[dict],
+    ) -> None:
+        """Append one full request/response record to the jsonl dump file."""
+        if not _dump_requests_enabled:
+            return
+        try:
+            record = {
+                "ts": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+                "mode": mode,
+                "model": model,
+                "request": {"messages": OpenAILargeLanguageModel._serialize_prompt_messages(prompt_messages)},
+                "response": response,
+            }
+            if raw_usage:
+                record["usage"] = raw_usage
+            _prompt_cache_dump_logger.info(json.dumps(record, ensure_ascii=False, default=str))
+        except Exception as e:
+            print(f"[prompt-cache] failed to dump record: {e}", flush=True)
 
     @staticmethod
     def _adapt_schema_for_structured_outputs(schema: dict) -> dict:
