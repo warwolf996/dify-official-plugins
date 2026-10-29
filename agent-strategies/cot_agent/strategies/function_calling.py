@@ -153,9 +153,12 @@ class FunctionCallingAgentStrategy(AgentStrategy):
         iteration_step: int,
         max_iteration_steps: int,
     ) -> tuple[bool, bool]:
+        # Do not stream content for rounds that contain tool calls (including
+        # the final round): some providers/models emit tool-call arguments as
+        # text content, which would leak raw parameters to the user. A forced
+        # no-tools answer round after the loop provides the final text instead.
         should_stream = (
             not function_call_state
-            or iteration_step == max_iteration_steps
             or (thinking_started and content.strip() == THINK_END)
         )
         if should_stream:
@@ -715,6 +718,64 @@ class FunctionCallingAgentStrategy(AgentStrategy):
                 for resp in tool_responses:
                     yield self.create_text_message(str(resp["tool_response"]))
             iteration_step += 1
+
+        # Force a final direct answer when the loop ended because the max
+        # iteration limit was reached while the model still wanted tools.
+        # Invoke once more WITHOUT any tools so the model must answer in text
+        # instead of leaking the pending tool-call arguments to the user.
+        if function_call_state and max_iteration_steps > 1:
+            current_thoughts.append(
+                UserPromptMessage(
+                    content=(
+                        "You have reached the maximum number of tool call rounds. "
+                        "Do not call any more tools. Answer the user's question "
+                        "directly using the information gathered so far."
+                    )
+                )
+            )
+            prompt_messages = self._organize_prompt_messages(
+                history_prompt_messages=history_prompt_messages,
+                current_thoughts=current_thoughts,
+                model=model,
+            )
+            if model.entity and model.completion_params:
+                self.recalc_llm_max_tokens(
+                    model.entity, prompt_messages, model.completion_params
+                )
+            model_config = LLMModelConfig(**model.model_dump(mode="json"))
+            final_chunks: Generator[LLMResultChunk, None, None] | LLMResult = (
+                self.session.model.llm.invoke(
+                    model_config=model_config,
+                    prompt_messages=prompt_messages,
+                    stop=stop,
+                    stream=stream,
+                    tools=None,
+                )
+            )
+            if isinstance(final_chunks, Generator):
+                for chunk in final_chunks:
+                    if chunk.delta.message and chunk.delta.message.content:
+                        if isinstance(chunk.delta.message.content, list):
+                            for content in chunk.delta.message.content:
+                                yield self.create_text_message(content.data)
+                        else:
+                            yield self.create_text_message(
+                                str(chunk.delta.message.content)
+                            )
+                    if chunk.delta.usage:
+                        self.increase_usage(llm_usage, chunk.delta.usage)
+            else:
+                final_result = cast(LLMResult, final_chunks)
+                if final_result.message and final_result.message.content:
+                    if isinstance(final_result.message.content, list):
+                        for content in final_result.message.content:
+                            yield self.create_text_message(content.data)
+                    else:
+                        yield self.create_text_message(
+                            str(final_result.message.content)
+                        )
+                if final_result.usage:
+                    self.increase_usage(llm_usage, final_result.usage)
 
         # If context is a list of dict, create retriever resource message
         if isinstance(fc_params.context, list):
